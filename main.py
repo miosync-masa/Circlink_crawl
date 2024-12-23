@@ -25,15 +25,13 @@ client = OpenAI(api_key=openai_api_key)
 
 upstash_vector_endpoint = os.getenv("UPSTASH_VECTOR_ENDPOINT")
 upstash_vector_token = os.getenv("UPSTASH_VECTOR_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Increase chunk size to avoid large metadata errors
 Settings.text_splitter = SentenceSplitter(chunk_size=4096)
 
 # Configure UpStash VectorDB
 vector_index = Index(url=upstash_vector_endpoint, token=upstash_vector_token)
-storage_context = StorageContext.from_defaults(vector_store=vector_index)
-
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Connect to the database
 try:
@@ -41,9 +39,6 @@ try:
     cursor = conn.cursor()
 except Exception as e:
     st.error(f"Database connection failed: {e}")
-
-# Initialize an empty VectorStoreIndex
-llama_index = VectorStoreIndex([], storage_context=storage_context)
 
 # 現在の日付を作成日時として設定
 created_at = datetime.now().strftime("%Y-%m-%d")
@@ -197,35 +192,57 @@ def generate_tags(job_data):
 
 # 一意のLlama ID生成関数
 def generate_llama_id():
-    return str(uuid.uuid4()) 
- 
+    return str(uuid.uuid4())
+
 # SQLデータベース保存関数        
 def save_to_sql_db(job_data, sql_cursor):
-    # LlamaIndex用の一意IDを生成
-    llama_id = generate_llama_id()
+    try:
+        # LlamaIndex用の一意IDを生成
+        llama_id = generate_llama_id()
 
-    # SQLに保存
-    sql_cursor.execute("""
-        INSERT INTO job_metadata (id, llama_id, main_title, company_name, url, what, why, how, "do", created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-    """, (
-        job_data["id"],          # ジョブID
-        llama_id,                # LlamaIndexの一意ID
-        job_data["main_title"],
-        job_data["company_name"],
-        job_data["url"],
-        job_data["what"],
-        job_data["why"],
-        job_data["how"],
-        job_data["do"]
-    ))
+        # デバッグ出力: タグの確認
+        print(f"Generated tags: {job_data['tags']}")
 
-    return llama_id  # 作成したLlamaIndex用IDを返す    
-    
+        # SQLに保存
+        sql_cursor.execute("""
+            INSERT INTO job_metadata (
+                id, llama_id, main_title, company_name, url, what, why, how, "do",
+                members, stories, tags, is_active, created_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, NOW()
+            )
+        """, (
+            job_data["id"],          # ジョブID
+            llama_id,                # LlamaIndexの一意ID
+            job_data["main_title"],  # メインタイトル
+            job_data["company_name"],# 会社名
+            job_data["url"],         # URL
+            job_data["what"],        # なにをやっているのか
+            job_data["why"],         # なぜやるのか
+            job_data["how"],         # どうやっているのか
+            job_data["do"],          # こんなことやります
+            json.dumps(job_data["members"]),  # メンバー (JSON形式)
+            json.dumps(job_data["stories"]),  # ストーリー (JSON形式)
+            json.dumps(job_data["tags"]),     # タグ (JSON形式)
+            job_data.get("is_active", True)   # アクティブ状態 (デフォルト: True)
+        ))
+
+        # コミットを追加
+        sql_cursor.connection.commit()
+        print("SQL DB save completed.")
+
+        return llama_id
+    except Exception as e:
+        print(f"Error saving to SQL DB: {e}")
+        raise
+        
+# UpstashにVectorデータとMetaデータを保存   
 def save_to_llama_index_with_embedding(job_data, index, sql_cursor):
     try:
         # SQLDBに保存し、一意のLlama IDを取得
         llama_id = save_to_sql_db(job_data, sql_cursor)
+        print(f"Llama ID generated: {llama_id}")
 
         # 結合されたテキストを生成
         combined_text = f"""
@@ -236,41 +253,35 @@ def save_to_llama_index_with_embedding(job_data, index, sql_cursor):
         どうやっているのか: {job_data['how']}
         こんなことやります: {job_data['do']}
         """
+        print("Combined text for embedding:", combined_text)
 
         # 埋め込み生成
         embedding = get_embedding(combined_text, model="text-embedding-3-small")
-        tags = generate_tags(job_data)
+        print("Generated embedding:", embedding)
+
+        # タプル形式のデータ
+        file_id = str(uuid.uuid4())  # UUID4で一意のIDを生成
+        metadata = {
+            "llama_id": llama_id,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        print("Metadata for Upstash:", metadata)
 
         # Upstash Vectorに保存
-        upstash_data = {
-            "id": llama_id,  # LlamaIndex用ID
-            "vector": embedding,  # 埋め込みデータ
-            "metadata": {
-                "job_id": job_data["id"],
-                "tags": tags,
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-        }
-
-        # 実際の保存処理
-        index.upsert(vectors=[upstash_data])
+        index.upsert(vectors=[(file_id, embedding, metadata)])
+        print("Upstash save completed.")
 
         # 結果を辞書形式で返す
         return {
             "llama_id": llama_id,
-            "upstash_data": upstash_data,
+            "file_id": file_id,
             "status": "success",
             "message": "Data successfully saved to SQL and Upstash"
         }
 
     except Exception as e:
-        # エラー発生時のログと応答
-        return {
-            "llama_id": None,
-            "upstash_data": None,
-            "status": "error",
-            "message": f"Failed to save data: {e}"
-        }
+        print(f"Error saving to Upstash: {e}")
+        raise
 
 # --- Streamlit UI Flow ---
 if st.button("Fetch Job Data"):
@@ -286,6 +297,10 @@ if st.button("Fetch Job Data"):
             
             # 3. LLMを使ったタグ生成
             tags = generate_tags(job_data)
+            job_data['tags'] = tags  # Ensure tags are assigned to job_data
+
+            # デバッグ出力: タグの確認
+            print(f"Generated tags: {tags}")
 
             # 4. セッションにデータを格納（一時保存）
             st.session_state["job_data"] = job_data
@@ -313,14 +328,13 @@ if st.button("Fetch Job Data"):
 if st.session_state["job_data"] and st.session_state["job_id"] and st.button("Approve and Save"):
     try:
         # LlamaIndexとUpstash Vectorへの保存
-        save_to_llama_index_with_embedding(st.session_state["job_data"], llama_index, cursor)
-
+        result = save_to_llama_index_with_embedding(st.session_state["job_data"], vector_index, cursor)
         st.success(
             f"Job '{st.session_state['job_data']['main_title']}' "
             f"with ID '{st.session_state['job_id']}' "
             "saved successfully to UpStash and SQL!"
         )
+        st.write("Save result:", result)
     except Exception as e:
         # 例外処理
         st.error(f"Error saving job data: {e}")
-
